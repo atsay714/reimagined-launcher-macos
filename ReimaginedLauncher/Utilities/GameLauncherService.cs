@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using ReimaginedLauncher.HttpClients.Models;
 
 namespace ReimaginedLauncher.Utilities;
 
@@ -569,7 +570,10 @@ public class GameLauncherService
         return string.Join(" ", launchParameters);
     }
 
-    public string BuildLaunchCommand(string? launchParamOverride = null, string? gamePathOverride = null)
+    public string BuildLaunchCommand(
+        string? launchParamOverride = null,
+        string? gamePathOverride = null,
+        LadderLoaderType loaderType = LadderLoaderType.D2RLoader)
     {
         var profile = MainWindow.Settings.CurrentProfile;
         if (profile.Type == InstallationType.D2RMM)
@@ -585,6 +589,50 @@ public class GameLauncherService
         var launchParameters = string.IsNullOrWhiteSpace(launchParamOverride)
             ? LaunchParameters
             : launchParamOverride;
+        var useReimaginedLoader = profile.LaunchExperience == LaunchExperience.Ladder
+                                  && loaderType == LadderLoaderType.ReimaginedLoader;
+
+        if (useReimaginedLoader)
+        {
+            if (!D2RLoaderService.CanUseLadderLoader(profile, loaderType, allowMissingLoader: false, out var reason))
+            {
+                return $"Reimagined Loader unavailable: {reason}";
+            }
+
+            var hostPath = Path.Combine(profile.InstallDirectory!, D2RLoaderInstallerService.ExecutableName(LadderLoaderType.ReimaginedLoader));
+            if (OperatingSystem.IsLinux())
+            {
+                var linuxArgs = BuildReimaginedLoaderArguments(profile.InstallDirectory!, launchParameters, includeGameDir: false);
+                if (profile.Type == InstallationType.Steam)
+                {
+                    if (IsSteamFlatpakInstall(profile.InstallDirectory))
+                    {
+                        return "Flatpak Steam is not supported for Reimagined Loader. Only native Steam installation is supported.";
+                    }
+                    var steamInstallPath = GetSteamInstallPath(installDirectory: profile.InstallDirectory);
+                    if (!IsValidSteamProtonLaunch(profile, steamInstallPath, hostPath, out var error))
+                    {
+                        return error;
+                    }
+                    if (UsesSteamHandoff(profile))
+                    {
+                        return BuildSteamHandoffPreview(hostPath, linuxArgs, profile);
+                    }
+                    var steamApps = FileService.FindAncestorDirectory(profile.InstallDirectory, SteamAppsDirName);
+                    var steamProtonEnvVars = new Dictionary<string, string>();
+                    PopulateSteamProtonEnvVars(steamProtonEnvVars, profile, steamInstallPath!, steamApps);
+                    var envVarsExports = string.Join("\n", steamProtonEnvVars.Select(kvp => $"export {kvp.Key}=\"{kvp.Value}\""));
+                    return $"{envVarsExports}\n \"{profile.ProtonExecutable}\" {BuildSteamProtonArguments(hostPath, linuxArgs)}";
+                }
+
+                var winePath = FindExecutableOnPath("wine") ?? "wine";
+                var winePrefix = FindWinePrefix(hostPath);
+                var prefix = winePrefix is null ? string.Empty : $"WINEPREFIX=\"{winePrefix}\" ";
+                return $"{prefix}\"{winePath}\" \"{hostPath}\" {linuxArgs}";
+            }
+
+            return $"\"{hostPath}\" {BuildReimaginedLoaderArguments(profile.InstallDirectory!, launchParameters, includeGameDir: true)}";
+        }
 
         if (UsesD2RLoader(profile))
         {
@@ -689,12 +737,49 @@ public class GameLauncherService
            + (profile.EnableLsfg ? "LSFG wrapper: ~/lsfg (game only)." + Environment.NewLine : "")
            + $"\"{executable}\" {arguments}";
 
-    /// <summary>Starts the selected installation route while retaining any reserved Steam launch ownership.</summary>
-    public Process? LaunchGame(string? launchParamOverride = null, string? gamePathOverride = null)
-        => LaunchGame(null, launchParamOverride, gamePathOverride);
+    public static string BuildReimaginedLoaderArguments(string installDirectory, string launchParameters, bool includeGameDir = true)
+    {
+        if (!includeGameDir)
+        {
+            return $"-- {launchParameters}";
+        }
+
+        // Normalized install directories end with a trailing backslash (e.g. "C:\...\Diablo II Resurrected\").
+        // Passing `\"` inside a quoted Windows command-line argument escapes the closing quote in
+        // CommandLineToArgvW/MSVC argv parsing and swallows `-- -mod ...` into --game-dir.
+        // Trim both separator kinds explicitly so Windows paths format identically on Linux runners.
+        var trimmed = installDirectory.Trim();
+        while (trimmed.Length > 1 && (trimmed[^1] == '\\' || trimmed[^1] == '/'))
+        {
+            if (trimmed.Length == 3 && char.IsAsciiLetter(trimmed[0]) && trimmed[1] == ':')
+            {
+                break;
+            }
+
+            trimmed = trimmed[..^1];
+        }
+
+        if (trimmed.EndsWith('\\'))
+        {
+            // Drive root like "C:\": double the trailing backslash so it does not escape the closing quote.
+            trimmed += "\\";
+        }
+        return $"--game-dir \"{trimmed}\" -- {launchParameters}";
+    }
 
     /// <summary>Starts the selected installation route while retaining any reserved Steam launch ownership.</summary>
-    internal Process? LaunchGame(SteamGameHandoff? reservation, string? launchParamOverride = null, string? gamePathOverride = null)
+    public Process? LaunchGame(
+        string? launchParamOverride = null,
+        string? gamePathOverride = null,
+        LadderLoaderType loaderType = LadderLoaderType.D2RLoader)
+        => LaunchGame(null, launchParamOverride, gamePathOverride, loaderType);
+
+    /// <summary>Starts the selected installation route while retaining any reserved Steam launch ownership.</summary>
+    internal Process? LaunchGame(
+        SteamGameHandoff? reservation,
+        string? launchParamOverride = null,
+        string? gamePathOverride = null,
+        LadderLoaderType loaderType = LadderLoaderType.D2RLoader)
     {
         var profile = MainWindow.Settings.CurrentProfile;
         
@@ -709,6 +794,8 @@ public class GameLauncherService
         var launchParameters = string.IsNullOrWhiteSpace(launchParamOverride)
             ? LaunchParameters
             : launchParamOverride;
+        var useReimaginedLoader = profile.LaunchExperience == LaunchExperience.Ladder
+                                  && loaderType == LadderLoaderType.ReimaginedLoader;
 
         string executablePath;
         string finalArgs;
@@ -720,13 +807,20 @@ public class GameLauncherService
         {
             try
             {
-                if (UsesD2RLoader(profile) && !D2RLoaderService.CanUseOnlineExperience(profile, out var reason))
+                if (useReimaginedLoader)
+                {
+                    if (!D2RLoaderService.CanUseLadderLoader(profile, loaderType, allowMissingLoader: false, out var reason))
+                        throw new InvalidOperationException(reason ?? "Reimagined Loader is not available.");
+                }
+                else if (UsesD2RLoader(profile) && !D2RLoaderService.CanUseOnlineExperience(profile, out var reason))
+                {
                     throw new InvalidOperationException(reason ?? "D2RLoader is not available.");
+                }
                 if (!File.Exists(Path.Combine(SteamGameHandoff.StateDirectory, "registration.json")))
                     throw new InvalidOperationException("Register the native launcher's Steam game session before playing in Gaming Mode. See LINUX.md for one-time setup.");
-                if (D2RLoaderService.IsInstalled(profile.InstallDirectory))
+                if (D2RLoaderService.IsInstalled(profile.InstallDirectory) || useReimaginedLoader)
                     D2RLoaderService.SetDefaultMod(profile.InstallDirectory!, profile.LaunchExperience);
-                var handoff = SteamGameHandoff.Start(profile, launchParameters, reservation);
+                var handoff = SteamGameHandoff.Start(profile, launchParameters, reservation, loaderType);
                 ActiveSteamHandoff = handoff.Session;
                 return handoff.Command;
             }
@@ -760,6 +854,53 @@ public class GameLauncherService
 
             // Matches the command Lutris writes into its own desktop shortcuts.
             environmentOverrides["LUTRIS_SKIP_INIT"] = "1";
+        }
+        else if (useReimaginedLoader)
+        {
+            if (!D2RLoaderService.CanUseLadderLoader(profile, loaderType, allowMissingLoader: false, out var reason))
+            {
+                Notifications.SendNotification(reason ?? "Reimagined Loader is not available.", "Warning");
+                return null;
+            }
+
+            var hostPath = Path.Combine(profile.InstallDirectory!, D2RLoaderInstallerService.ExecutableName(LadderLoaderType.ReimaginedLoader));
+            if (OperatingSystem.IsLinux())
+            {
+                var linuxArgs = BuildReimaginedLoaderArguments(profile.InstallDirectory!, launchParameters, includeGameDir: false);
+                if (profile.Type == InstallationType.Steam)
+                {
+                    var steamInstallPath = GetSteamInstallPath(installDirectory: profile.InstallDirectory);
+                    if (!IsValidSteamProtonLaunch(profile, steamInstallPath, hostPath, out var error))
+                    {
+                        Notifications.SendNotification(error, "Warning");
+                        return null;
+                    }
+
+                    var steamApps = FileService.FindAncestorDirectory(profile.InstallDirectory, SteamAppsDirName);
+                    PopulateSteamProtonEnvVars(environmentOverrides, profile, steamInstallPath!, steamApps);
+                    executablePath = profile.ProtonExecutable!;
+                    finalArgs = BuildSteamProtonArguments(hostPath, linuxArgs);
+                }
+                else
+                {
+                    executablePath = FindExecutableOnPath("wine") ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(executablePath))
+                    {
+                        Notifications.SendNotification("Wine was not found. Install Wine to use Reimagined Loader.", "Warning");
+                        return null;
+                    }
+
+                    winePrefix = FindWinePrefix(hostPath);
+                    finalArgs = $"\"{hostPath}\" {linuxArgs}";
+                }
+            }
+            else
+            {
+                executablePath = hostPath;
+                finalArgs = BuildReimaginedLoaderArguments(profile.InstallDirectory!, launchParameters, includeGameDir: true);
+            }
+
+            workingDirectory = profile.InstallDirectory;
         }
         else if (UsesD2RLoader(profile))
         {
@@ -864,8 +1005,12 @@ public class GameLauncherService
         var processStartInfo = UsesSingleSteamSession(profile)
             ? SteamGameHandoff.CreateGameStartInfo(new SteamHandoffRequest("single-session", DateTimeOffset.UtcNow,
                 GetSteamInstallPath(installDirectory: profile.InstallDirectory)!, profile.InstallDirectory!, profile.ProtonExecutable!,
-                Path.Combine(profile.InstallDirectory!, UsesD2RLoader(profile) ? "D2RLoader.exe" : "D2R.exe"),
-                SteamGameHandoff.SplitArguments(launchParameters), profile.EnableLsfg))
+                Path.Combine(profile.InstallDirectory!,
+                    useReimaginedLoader ? D2RLoaderInstallerService.ExecutableName(LadderLoaderType.ReimaginedLoader)
+                    : UsesD2RLoader(profile) ? "D2RLoader.exe" : "D2R.exe"),
+                useReimaginedLoader
+                    ? ["--", .. SteamGameHandoff.SplitArguments(launchParameters)]
+                    : SteamGameHandoff.SplitArguments(launchParameters), profile.EnableLsfg))
             : CreateProcessStartInfo(executablePath, finalArgs, workingDirectory);
         LaunchDiagnostics.Log($"Working directory: {processStartInfo.WorkingDirectory}");
 
@@ -884,7 +1029,7 @@ public class GameLauncherService
 
         try
         {
-            if (D2RLoaderService.IsInstalled(profile.InstallDirectory))
+            if (D2RLoaderService.IsInstalled(profile.InstallDirectory) || useReimaginedLoader)
                 D2RLoaderService.SetDefaultMod(profile.InstallDirectory!, profile.LaunchExperience);
             var process = Process.Start(processStartInfo);
             if (process == null)
@@ -1072,9 +1217,16 @@ public class GameLauncherService
         return profile.LaunchExperience is LaunchExperience.Online or LaunchExperience.Ladder;
     }
 
-    public string? GetExpectedGameExecutablePath()
+    public string? GetExpectedGameExecutablePath(LadderLoaderType loaderType = LadderLoaderType.D2RLoader)
     {
         var profile = MainWindow.Settings.CurrentProfile;
+        if (profile.LaunchExperience == LaunchExperience.Ladder && loaderType == LadderLoaderType.ReimaginedLoader)
+        {
+            var normalized = InstallDirectoryValidator.NormalizeInstallDirectory(profile.InstallDirectory);
+            return string.IsNullOrWhiteSpace(normalized)
+                ? null
+                : Path.Combine(normalized, D2RLoaderInstallerService.ExecutableName(LadderLoaderType.ReimaginedLoader));
+        }
         return UsesD2RLoader(profile)
             ? D2RLoaderService.GetLoaderPath(profile.InstallDirectory)
             : InstallDirectoryValidator.GetExecutablePath(profile.InstallDirectory);
